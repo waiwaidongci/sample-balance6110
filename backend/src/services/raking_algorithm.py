@@ -21,7 +21,7 @@ def validate_targets(units,targets):
         if any(value>0 and cat not in observed for cat,value in margin.items()): raise ValueError('结构零：目标类别没有样本支持，不能校准')
     return margins,totals[0]
 
-def calibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
+def _prepare(units,targets,tolerance,max_iterations,cap_ratio):
     if not math.isfinite(tolerance) or not .000001<=tolerance<=.05 or not 1<=max_iterations<=2000 or not math.isfinite(cap_ratio) or not 1<=cap_ratio<=30: raise ValueError('校准参数越界')
     units=sorted(units,key=lambda u:u['code']);targets=sorted(targets,key=lambda t:(str(t['dimension']),t['category']))
     if len({u['code'] for u in units})!=len(units): raise ValueError('样本编号重复')
@@ -29,28 +29,38 @@ def calibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
         if not all(dim in u and isinstance(u[dim],str) and u[dim] for dim in DIMS): raise ValueError('样本维度缺失')
         if not math.isfinite(u['base_weight']) or u['base_weight']<=0 or not math.isfinite(u['trip_minutes']) or u['trip_minutes']<0: raise ValueError('样本值必须为有限非负值，初始权重须正')
     margins,total=validate_targets(units,targets)
-    initial=[u['base_weight'] for u in units];weights=[x*total/sum(initial) for x in initial]
-    cap=cap_ratio*total/len(units)
-    trace=[];converged=False
+    values={dim:[u[dim] for u in units] for dim in margins}
+    return units,targets,margins,total,values
+
+def _fit(values,margins,initial,total,cap,tolerance,max_iterations):
+    weights=[w*total/sum(initial) for w in initial]
+    trace=[]
     for iteration in range(1,max_iterations+1):
         for dim,margin in sorted(margins.items()):
             current=defaultdict(float)
-            for u,w in zip(units,weights):current[u[dim]]+=w
+            for value,w in zip(values[dim],weights):current[value]+=w
             factors={}
             for cat,target in margin.items():
                 if current[cat]<=1e-15:
                     if target>0: raise ValueError('零权重类别无法达到正目标，请检查交叉结构零')
                     factors[cat]=0
                 else:factors[cat]=target/current[cat]
-            weights=[w*factors[u[dim]] for u,w in zip(units,weights)]
+            weights=[w*factors[value] for value,w in zip(values[dim],weights)]
         weights=[min(cap,w) for w in weights]
         residual=0
         for dim,margin in margins.items():
             actual=defaultdict(float)
-            for u,w in zip(units,weights):actual[u[dim]]+=w
+            for value,w in zip(values[dim],weights):actual[value]+=w
             residual=max(residual,max(abs(actual[cat]-target)/total for cat,target in margin.items()))
         trace.append({'iteration':iteration,'max_residual':residual})
-        if residual<=tolerance:converged=True;break
+        if residual<=tolerance:return weights,trace,True,iteration,residual
+    return weights,trace,False,max_iterations,residual
+
+def calibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
+    units,sorted_targets,margins,total,values=_prepare(units,targets,tolerance,max_iterations,cap_ratio)
+    initial=[u['base_weight'] for u in units]
+    cap=cap_ratio*total/len(units)
+    weights,trace,converged,iteration,residual=_fit(values,margins,initial,total,cap,tolerance,max_iterations)
     sum_w=sum(weights);sum_sq=sum(w*w for w in weights)
     if sum_w<=1e-12 or sum_sq<=1e-12:raise ValueError('有效权重总量为零')
     ess=sum_w*sum_w/sum_sq;deff=len(units)/ess
@@ -60,6 +70,21 @@ def calibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
             indexes=[i for i,u in enumerate(units) if u[dim]==cat]
             actual=sum(weights[i] for i in indexes)
             diagnostics.append({'dimension':dim,'category':cat,'sample_count':len(indexes),'unweighted_share':len(indexes)/len(units),'target':target,'target_share':target/total,'weighted':actual,'weighted_share':actual/sum_w,'residual':actual-target})
-    payload={'units':[{k:u[k] for k in ['code','zone','age_band','mode','trip_minutes','base_weight']} for u in units],'targets':targets,'tolerance':tolerance,'max_iterations':max_iterations,'cap_ratio':cap_ratio}
+    payload={'units':[{k:u[k] for k in ['code','zone','age_band','mode','trip_minutes','base_weight']} for u in units],'targets':sorted_targets,'tolerance':tolerance,'max_iterations':max_iterations,'cap_ratio':cap_ratio}
     checksum=hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
     return {'converged':converged,'iterations':iteration,'max_residual':residual,'target_total':total,'weight_total':sum_w,'sample_count':len(units),'effective_sample_size':ess,'design_effect':deff,'weight_min':min(weights),'weight_max':max(weights),'weight_cap':cap,'unweighted_mean':mean(u['trip_minutes'] for u in units),'weighted_mean':sum(u['trip_minutes']*w for u,w in zip(units,weights))/sum_w,'diagnostics':diagnostics,'trace':trace,'assignments':[dict(u,weight=w) for u,w in zip(units,weights)],'checksum':checksum,'method_note':'逐维IPF后截断权重，可能无法收敛；残差为类别绝对偏差除目标总量。Kish有效样本仅反映权重离散，不包含聚类/分层设计或未观测偏差。加权均值为描述性估计。'}
+
+def recalibrate(units,targets,tolerance=.001,max_iterations=200,cap_ratio=8):
+    """Same bounded IPF and validation as calibrate, but returns only what a bootstrap replicate needs.
+
+    Resample multiplicity is expressed by listing a unit once per draw and giving every copy the
+    same positive initial weight, which is exactly the intended frequency weight.
+    """
+    units,_sorted_targets,margins,total,values=_prepare(units,targets,tolerance,max_iterations,cap_ratio)
+    initial=[u['base_weight'] for u in units]
+    cap=cap_ratio*total/len(units)
+    weights,_trace,converged,iteration,residual=_fit(values,margins,initial,total,cap,tolerance,max_iterations)
+    sum_w=sum(weights)
+    if sum_w<=1e-12:raise ValueError('有效权重总量为零')
+    sum_sq=sum(w*w for w in weights)
+    return {'converged':converged,'iterations':iteration,'max_residual':residual,'weight_total':sum_w,'effective_sample_size':sum_w*sum_w/sum_sq,'weighted_mean':sum(u['trip_minutes']*w for u,w in zip(units,weights))/sum_w}

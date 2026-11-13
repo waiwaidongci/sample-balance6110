@@ -1,9 +1,10 @@
 import random
 from sqlalchemy import select,func
 from src.config.database import Base,engine,SessionLocal
-from src.models import User,SampleBatch,SampleUnit,MarginTarget,WeightRun,WeightReview
+from src.models import User,SampleBatch,SampleUnit,MarginTarget,WeightRun,WeightReview,BootstrapAnalysis
 from src.utils.security import hash_password
 from src.services.run_service import compute
+from src.services.bootstrap_service import compute as compute_bootstrap
 
 def seed():
     Base.metadata.create_all(engine)
@@ -30,6 +31,9 @@ def seed():
             batch=db.scalar(select(SampleBatch).where(SampleBatch.code=='nov-city'))
             run=WeightRun(name=name,batch_id=batch.id,created_by=user.id,tolerance=.00001,max_iterations=500,cap_ratio=12);db.add(run);db.commit();compute(db,run.id)
             if run.result['converged']:db.add(WeightReview(run_id=run.id,decision='approved',note='合成样本演示：边际已收敛，保留有效样本与方法边界。',reviewer_id=user.id));db.commit()
+        run=db.scalar(select(WeightRun).where(WeightRun.name==name))
+        if run and run.status=='completed' and not db.scalar(select(BootstrapAnalysis).where(BootstrapAnalysis.run_id==run.id)):
+            analysis=BootstrapAnalysis(run_id=run.id,replicates=60,seed=73,created_by=user.id);db.add(analysis);db.commit();compute_bootstrap(db,analysis.id)
         counts={name:db.scalar(select(func.count()).select_from(model)) for name,model in [('users',User),('batches',SampleBatch),('units',SampleUnit),('targets',MarginTarget),('runs',WeightRun),('reviews',WeightReview)]}
         print(counts);return counts
 if __name__=='__main__':seed()

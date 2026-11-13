@@ -42,9 +42,19 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 独立4样本oracle：A组目标60、B组40，其余两维50/50，权重应为30/30/20/20；加权时长23、原始25、ESS10000/2600、设计效应1.04。cap_ratio=1不能满足目标，必须显示未收敛。
 
+### 重抽样不确定性（bootstrap）
+
+实现位置 `backend/src/services/bootstrap_service.py`，入口条目的重抽样部分复用 `recalibrate`（与 `calibrate` 共用同一 `_fit` 迭代、截断与校验）。
+
+- 每份重抽样从该次运行保留的样本快照中有放回抽取与原样本相同数量的观测；重复抽中的观测按次数分别复制参与校准（等价于频数权重）。原目标边际取自运行快照，容差、迭代上限与截断倍数沿用原运行参数。
+- 随机抽样用 `random.Random(seed)` 逐份生成；相同原运行、种子与次数得到逐份相同的结果。重抽样输入另有SHA256（原运行输入SHA256 + 种子 + 次数 + 参数），保留在结果中。
+- 每份结果若未收敛、抛错或加权均值非有限，则排除并记录原因。有效次数 ≥ ⌈0.9×次数⌉ 时才报告百分位法95%均值区间（线性插值）与标准误；否则 `interval` 为 null，页面显示“未给出区间”及有效次数。
+- 计算经Redis队列 `balance:bootstrap` 由同一独立worker排队执行，与校准任务共用进程；结果写入独立表 `bootstrap_analyses`，不修改原运行的权重、导出与复核。
+- 演示种子附带一份60次/种子73的重抽样结果；默认页面提交200次、种子20261113，次数取20..1000。
+
 ## 页面与结构
 
-六个研究页面：总览、样本底册、目标边际、校准配置/记录、诊断结果、复核交付（含有权角色的审计）。BatchSelect、RunTable、CalibrationSummary、MarginTable跨页复用；PageHeading/ErrorNotice/StatusBadge为公共组件；useTask/usePolling与格式工具共享。初始3批共1280条样本、27个目标格、一个实际计算的初始运行及获批记录，种子73/74/75。
+六个研究页面：总览、样本底册、目标边际、校准配置/记录、诊断结果、复核交付（含有权角色的审计）。BatchSelect、RunTable、CalibrationSummary、MarginTable、BootstrapPanel跨页复用；PageHeading/ErrorNotice/StatusBadge为公共组件；useTask/usePolling与格式工具共享。初始3批共1280条样本、27个目标格、一个实际计算的初始运行、获批记录及一份重抽样结果，种子73/74/75。
 
 前端：`src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；后端：`src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；种子在`backend/scripts/seed_demo.py`，结构约束见`backend/migrations/001_schema.md`。测试、截图和TESTING只在批次`test-artifacts/gb-0015/`。
 
